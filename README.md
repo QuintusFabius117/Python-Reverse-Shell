@@ -1,7 +1,7 @@
 # Python-Reverse-Shell
 
 ## Purpose
-A reverse shell made with python that has upload and download capabilities
+A reverse shell made with python
 
 ## Skills Learned
 
